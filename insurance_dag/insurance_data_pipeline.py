@@ -15,9 +15,9 @@ def loading_raw_data():
     conn = snowflake.connector.connect(**snowflake_args)
     cursor = conn.cursor()
     cursor.execute("PUT file:///opt/airflow/data/insurance.csv @INTERNAL_STAGE/insurance;")
-    cursor.execute("TRUNCATE TABLE raw_insurance_data;")
+    cursor.execute("CREATE OR REPLACE TABLE raw_insurance_data(var VARIANT);")
     cursor.execute("""
-        INSERT INTO raw_insurance_data (raw_col)
+        INSERT INTO raw_insurance_data (var)
         SELECT 
           V
         FROM @INTERNAL_STAGE/insurance (FILE_FORMAT => TEXT_FORMAT, PATTERN => '.*.csv.gz') STG
@@ -30,80 +30,92 @@ def loading_raw_data():
 def loading_struct_data():
     conn = snowflake.connector.connect(**snowflake_args)
     cursor = conn.cursor()
-    cursor.execute("TRUNCATE TABLE struct_insurance_data;")
 
     # Data cleaning (actualy it depends on what we can call an insufficient data) and then loading into a structured table
     cursor.execute("""
-        INSERT INTO struct_insurance_data (age, sex, bmi, children, smoker, region, charges)
-        SELECT DISTINCT
-          $1:AGE::INT AS AGE,
-          $1:SEX::VARCHAR AS SEX,
-          $1:BMI::NUMBER(5,2) AS BMI,
-          $1:CHILDREN::INT AS CHILDREN,
-          $1:SMOKER::VARCHAR AS SMOKER,
-          $1:REGION::VARCHAR AS REGION,
-          $1:CHARGES::NUMBER(7,2) AS CHARGES
-        FROM raw_insurance_data
-        WHERE CHARGES IS NOT NULL;""")
+        create or replace dynamic table struct_dt
+        target_lag = '5 minutes'
+        warehouse = example_wh
+        as
+            select distinct
+                $1:AGE::INT AS AGE,
+                $1:SEX::VARCHAR AS SEX,
+                $1:BMI::NUMBER(5,2) AS BMI,
+                $1:CHILDREN::INT AS CHILDREN,
+                $1:SMOKER::VARCHAR AS SMOKER,
+                $1:REGION::VARCHAR AS REGION,
+                $1:CHARGES::NUMBER(7,2) AS CHARGES
+                from raw_insurance_data
+                where charges is not NULL;""")
+    cursor.execute("alter dynamic table struct_dt refresh;")
     cursor.close()
     conn.close()
 
 def loading_smokers_stats():
     conn = snowflake.connector.connect(**snowflake_args)
     cursor = conn.cursor()
-    cursor.execute("TRUNCATE TABLE SMOKER_INSURANCE_STAT;")
 
     # statistics about smokers depending on the region
     cursor.execute("""
-        INSERT INTO SMOKER_INSURANCE_STAT
-        SELECT
-            region,
-            min(charges),
-            max(charges)
-        FROM struct_insurance_data
-        WHERE SMOKER = 'yes'
-        GROUP BY 1;""")
+        create or replace dynamic table smoker_dt_stat
+        target_lag = '5 minutes'
+        warehouse = example_wh
+        as
+            select
+                    region::varchar as region,
+                    min(charges)::NUMBER(7,2) as min_charger,
+                    max(charges)::NUMBER(7,2) as max_charges
+                from struct_dt
+                where smoker = 'yes'
+                group by 1;""")
+    cursor.execute("alter dynamic table smoker_dt_stat refresh;")
     cursor.close()
     conn.close()
 
 def loading_obesity_stats():
     conn = snowflake.connector.connect(**snowflake_args)
     cursor = conn.cursor()
-    cursor.execute("TRUNCATE TABLE OBESITY_INSURANCE_STAT;")
 
     # statistics about obesity depending on the region (bmi over 30)
     cursor.execute("""
-        INSERT INTO OBESITY_INSURANCE_STAT
-        SELECT
-            region,
-            min(charges),
-            max(charges)
-        FROM struct_insurance_data
-        WHERE BMI >= 30
-        GROUP BY 1;""")
+        create or replace dynamic table obesity_dt_stat
+        target_lag = '5 minutes'
+        warehouse = example_wh
+        as
+            select
+                    region::varchar as region,
+                    min(charges)::NUMBER(7,2) as min_charger,
+                    max(charges)::NUMBER(7,2) as max_charges
+                from struct_dt
+                where bmi > 30
+                group by 1;""")
+    cursor.execute("alter dynamic table obesity_dt_stat refresh;")
     cursor.close()
     conn.close()
 
 def loading_age_stats():
     conn = snowflake.connector.connect(**snowflake_args)
     cursor = conn.cursor()
-    cursor.execute("TRUNCATE TABLE AGE_INSURANCE_STAT;")
 
     # statistics about insurance payouts depending on age (w/o group concatenation)
     cursor.execute("""
-        INSERT INTO AGE_INSURANCE_STAT
-        SELECT
-            age,
-            min(charges),
-            max(charges)
-        FROM struct_insurance_data
-        GROUP BY 1;""")
+        create or replace dynamic table age_dt_stat
+        target_lag = '5 minutes'
+        warehouse = example_wh
+        as
+            select
+                    age::NUMBER as age,
+                    min(charges)::NUMBER(7,2) as min_charger,
+                    max(charges)::NUMBER(7,2) as max_charges
+                from struct_dt
+                group by 1;""")
+    cursor.execute("alter dynamic table age_dt_stat refresh;")
     cursor.close()
     conn.close()
 
 def check_tables():
     conn = snowflake.connector.connect(**snowflake_args)
-    tables_to_check = ['SMOKER_INSURANCE_STAT', 'OBESITY_INSURANCE_STAT', 'AGE_INSURANCE_STAT']
+    tables_to_check = ['smoker_dt_stat', 'obesity_dt_stat', 'age_dt_stat']
     for table in tables_to_check:
         cursor = conn.cursor()
         cursor.execute(f"select count(*) from {table}")
